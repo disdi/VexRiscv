@@ -246,5 +246,11 @@ object Riscv{
     val TDATA2    = 0x7A2
     val TINFO     = 0x7a4
     val TCONTROL  = 0x7A5
+    
+    // Minimal CLIC CSRs
+    val MCLAIMI   = 0xFC0 // Machine claim interrupt register
+    val MITHRESHOLD = 0xFC1 // Machine interrupt threshold register
+    val MINTSTATUS = 0xFB1 // Machine interrupt status
+    val MIVT      = 0x307 // Machine interrupt vector table
   }
 }
