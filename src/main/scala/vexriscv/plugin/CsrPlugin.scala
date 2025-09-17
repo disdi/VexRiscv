@@ -84,10 +84,11 @@ case class CsrPluginConfig(
                             exportPrivilege     : Boolean = false,
                             var withPrivilegedDebug : Boolean = false, //For the official RISC-V debug spec implementation
                             var debugTriggers       : Int     = 2,
-                            // Minimal CLIC support
+                            // CLIC support
                             clicSupport         : Boolean = false,
-                            clicIntIdWidth      : Int = 12,  // Support up to 4096 interrupts
-                            clicIntPriorityWidth: Int = 8    // 8-bit priority levels
+                            clicMinimal         : Boolean = false,  // Use minimal CLIC implementation
+                            clicIntIdWidth      : Int = 12,  // Support up to 4096 interrupts (8 for minimal)
+                            clicIntPriorityWidth: Int = 8    // 8-bit priority levels (4 for minimal)
                           ){
   assert(!ucycleAccess.canWrite)
   def privilegeGen = userGen || supervisorGen || withPrivilegedDebug
@@ -642,7 +643,12 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
       clicInterrupt = in Bool() setName("clicInterrupt") default(False)
       clicInterruptId = in UInt(clicIntIdWidth bits) setName("clicInterruptId") 
       clicInterruptPriority = in UInt(clicIntPriorityWidth bits) setName("clicInterruptPriority")
-      clicClaim = out Bool() setName("clicClaim") default(False)
+      
+      // clicClaim only for standard CLIC, not minimal
+      if(!clicMinimal) {
+        clicClaim = out Bool() setName("clicClaim") default(False)
+      }
+      
       clicThreshold = out UInt(clicIntPriorityWidth bits) setName("clicThreshold")
     }
     contextSwitching = Bool().setName("contextSwitching")
@@ -1027,13 +1033,20 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
       val mcycle   = Reg(UInt(64 bits)) init(0)
       val minstret = Reg(UInt(64 bits)) init(0)
       
-      // Minimal CLIC CSRs
+      // CLIC CSRs
       val clic = clicSupport generate new Area {
         val mithreshold = Reg(UInt(clicIntPriorityWidth bits)) init(0)  // Interrupt threshold
-        val mintstatus = Reg(UInt(clicIntPriorityWidth bits)) init(0)   // Current interrupt level
         val mivt = Reg(UInt(xlen bits)) init(0)                         // Interrupt vector table base
-        val claimedId = Reg(UInt(clicIntIdWidth bits)) init(0)          // Last claimed interrupt ID
-        val claimedPriority = Reg(UInt(clicIntPriorityWidth bits)) init(0) // Last claimed priority
+        
+        // Standard CLIC only CSRs (not used in minimal)
+        val mintstatus = if(!clicMinimal) Reg(UInt(clicIntPriorityWidth bits)) init(0) else null   // Current interrupt level
+        val claimedId = if(!clicMinimal) Reg(UInt(clicIntIdWidth bits)) init(0) else null          // Last claimed interrupt ID
+        val claimedPriority = if(!clicMinimal) Reg(UInt(clicIntPriorityWidth bits)) init(0) else null // Last claimed priority
+        
+        // Minimal CLIC state
+        val interruptValid = if(clicMinimal) RegInit(False) else null
+        val interruptIdLatched = if(clicMinimal) Reg(UInt(clicIntIdWidth bits)) init(0) else null
+        val interruptPriorityLatched = if(clicMinimal) Reg(UInt(clicIntPriorityWidth bits)) init(0) else null
       }
 
 
@@ -1091,28 +1104,53 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
       
       // CLIC CSR mappings
       if(clicSupport) {
-        READ_WRITE(CSR.MITHRESHOLD, clic.mithreshold)
-        READ_WRITE(CSR.MINTSTATUS, clic.mintstatus)
-        READ_WRITE(CSR.MIVT, clic.mivt)
-        
-        // MCLAIMI - atomic claim register (read-only, with side effects)
-        READ_ONLY(CSR.MCLAIMI, clicIntIdWidth -> clic.claimedId, 0 -> clic.claimedPriority)
-        onRead(CSR.MCLAIMI) {
-          when(clicInterrupt && clicInterruptPriority > clic.mithreshold) {
-            clic.claimedId := clicInterruptId
-            clic.claimedPriority := clicInterruptPriority
-            clicClaim := True  // Signal to CLIC that interrupt is claimed
-          } otherwise {
-            clic.claimedId := 0
-            clic.claimedPriority := 0
+        if(clicMinimal) {
+          // Minimal CLIC CSR mappings
+          READ_WRITE(CSR.MITHRESHOLD, clic.mithreshold)  // 0xFC1
+          READ_WRITE(CSR.MIVT, clic.mivt)               // 0x307
+          
+          // Export threshold to CLIC
+          clicThreshold := clic.mithreshold
+          
+          // Edge detection for minimal CLIC (to avoid continuous triggering)
+          val clicInterruptReg = RegNext(clicInterrupt) init(False)
+          val clicInterruptRising = clicInterrupt && !clicInterruptReg
+          
+          // Latch interrupt on rising edge
+          when(clicInterruptRising && (clicInterruptPriority > clic.mithreshold)) {
+            clic.interruptValid := True
+            clic.interruptIdLatched := clicInterruptId
+            clic.interruptPriorityLatched := clicInterruptPriority
           }
+          
+          // Clear interrupt valid when taken (will be handled in interrupt jump logic)
+        } else {
+          // Standard CLIC CSR mappings
+          READ_WRITE(CSR.MITHRESHOLD, clic.mithreshold)
+          READ_WRITE(CSR.MINTSTATUS, clic.mintstatus)
+          READ_WRITE(CSR.MIVT, clic.mivt)
+          
+          // MCLAIMI - atomic claim register (read-only, with side effects)
+          READ_ONLY(CSR.MCLAIMI, clicIntIdWidth -> clic.claimedId, 0 -> clic.claimedPriority)
+          onRead(CSR.MCLAIMI) {
+            when(clicInterrupt && clicInterruptPriority > clic.mithreshold) {
+              clic.claimedId := clicInterruptId
+              clic.claimedPriority := clicInterruptPriority
+              clicClaim := True  // Signal to CLIC that interrupt is claimed
+            } otherwise {
+              clic.claimedId := 0
+              clic.claimedPriority := 0
+            }
+          }
+          
+          // Clear claim signal by default (standard CLIC only)
+          if(!clicMinimal) {
+            clicClaim := False
+          }
+          
+          // Export threshold to CLIC
+          clicThreshold := clic.mithreshold
         }
-        
-        // Clear claim signal by default
-        clicClaim := False
-        
-        // Export threshold to CLIC
-        clicThreshold := clic.mithreshold
       }
 
       //User CSR
@@ -1358,31 +1396,61 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
           val clicPriority = if(pipelinedInterrupt) Reg(UInt(clicIntPriorityWidth bits)) else UInt(clicIntPriorityWidth bits).assignDontCare()
           val clicId = if(pipelinedInterrupt) Reg(UInt(clicIntIdWidth bits)) else UInt(clicIntIdWidth bits).assignDontCare()
           
-          // CLIC interrupts take priority over regular interrupts
-          when(clicInterrupt && privilegeAllowInterrupts(3) && clicInterruptPriority > machineCsr.clic.mithreshold) {
-            valid := True
-            code := clicInterruptId.resized  // Use CLIC interrupt ID as trap cause
-            targetPrivilege := 3  // CLIC interrupts always target machine mode
-            clicPriority := clicInterruptPriority
-            clicId := clicInterruptId
-          } otherwise {
-            // Fall back to regular interrupt handling
-            while (privilegs.nonEmpty) {
-              val p = privilegs.head
-              when(privilegeAllowInterrupts(p)) {
-                for (i <- interruptSpecs
-                     if i.privilege <= p //EX : Machine timer interrupt can't go into supervisor mode
-                     if privilegs.tail.forall(e => i.delegators.exists(_.privilege == e))) { // EX : Supervisor timer need to have machine mode delegator
-                  val delegUpOn = i.delegators.filter(_.privilege > p).map(_.enable).fold(True)(_ && _)
-                  val delegDownOff = !i.delegators.filter(_.privilege <= p).map(_.enable).orR
-                  when(i.cond && delegUpOn && delegDownOff) {
-                    valid := True
-                    code := i.id
-                    targetPrivilege := p
+          if(clicMinimal) {
+            // Minimal CLIC interrupts take priority over regular interrupts
+            when(machineCsr.clic.interruptValid && privilegeAllowInterrupts(3)) {
+              valid := True
+              code := machineCsr.clic.interruptIdLatched.resized  // Use latched CLIC interrupt ID as trap cause
+              targetPrivilege := 3  // CLIC interrupts always target machine mode
+              clicPriority := machineCsr.clic.interruptPriorityLatched
+              clicId := machineCsr.clic.interruptIdLatched
+            } otherwise {
+              // Fall back to regular interrupt handling
+              while (privilegs.nonEmpty) {
+                val p = privilegs.head
+                when(privilegeAllowInterrupts(p)) {
+                  for (i <- interruptSpecs
+                       if i.privilege <= p //EX : Machine timer interrupt can't go into supervisor mode
+                       if privilegs.tail.forall(e => i.delegators.exists(_.privilege == e))) { // EX : Supervisor timer need to have machine mode delegator
+                    val delegUpOn = i.delegators.filter(_.privilege > p).map(_.enable).fold(True)(_ && _)
+                    val delegDownOff = !i.delegators.filter(_.privilege <= p).map(_.enable).orR
+                    when(i.cond && delegUpOn && delegDownOff) {
+                      valid := True
+                      code := i.id
+                      targetPrivilege := p
+                    }
                   }
                 }
+                privilegs = privilegs.tail
               }
-              privilegs = privilegs.tail
+            }
+          } else {
+            // Standard CLIC interrupts take priority over regular interrupts
+            when(clicInterrupt && privilegeAllowInterrupts(3) && clicInterruptPriority > machineCsr.clic.mithreshold) {
+              valid := True
+              code := clicInterruptId.resized  // Use CLIC interrupt ID as trap cause
+              targetPrivilege := 3  // CLIC interrupts always target machine mode
+              clicPriority := clicInterruptPriority
+              clicId := clicInterruptId
+            } otherwise {
+              // Fall back to regular interrupt handling
+              while (privilegs.nonEmpty) {
+                val p = privilegs.head
+                when(privilegeAllowInterrupts(p)) {
+                  for (i <- interruptSpecs
+                       if i.privilege <= p //EX : Machine timer interrupt can't go into supervisor mode
+                       if privilegs.tail.forall(e => i.delegators.exists(_.privilege == e))) { // EX : Supervisor timer need to have machine mode delegator
+                    val delegUpOn = i.delegators.filter(_.privilege > p).map(_.enable).fold(True)(_ && _)
+                    val delegDownOff = !i.delegators.filter(_.privilege <= p).map(_.enable).orR
+                    when(i.cond && delegUpOn && delegDownOff) {
+                      valid := True
+                      code := i.id
+                      targetPrivilege := p
+                    }
+                  }
+                }
+                privilegs = privilegs.tail
+              }
             }
           }
         } else {
@@ -1491,12 +1559,24 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
         jumpInterface.valid         := True
         if(clicSupport) {
           // CLIC vectoring support
-          when(interruptJump && interrupt.valid && clicInterrupt) {
-            // Use MIVT for CLIC hardware vectoring
-            jumpInterface.payload := machineCsr.clic.mivt + (interrupt.code << 2)
-          } otherwise {
-            // Regular trap vector calculation
-            jumpInterface.payload := (if(!xtvecModeGen) xtvec.base @@ U"00" else (xtvec.mode === 0 || hadException) ? (xtvec.base @@ U"00") | ((xtvec.base + trapCause) @@ U"00"))
+          if(clicMinimal) {
+            when(interruptJump && interrupt.valid && machineCsr.clic.interruptValid) {
+              // Use MIVT for CLIC hardware vectoring
+              jumpInterface.payload := machineCsr.clic.mivt + (interrupt.code << 2)
+              // Clear the interrupt valid flag for minimal CLIC
+              machineCsr.clic.interruptValid := False
+            } otherwise {
+              // Regular trap vector calculation
+              jumpInterface.payload := (if(!xtvecModeGen) xtvec.base @@ U"00" else (xtvec.mode === 0 || hadException) ? (xtvec.base @@ U"00") | ((xtvec.base + trapCause) @@ U"00"))
+            }
+          } else {
+            when(interruptJump && interrupt.valid && clicInterrupt) {
+              // Use MIVT for CLIC hardware vectoring
+              jumpInterface.payload := machineCsr.clic.mivt + (interrupt.code << 2)
+            } otherwise {
+              // Regular trap vector calculation
+              jumpInterface.payload := (if(!xtvecModeGen) xtvec.base @@ U"00" else (xtvec.mode === 0 || hadException) ? (xtvec.base @@ U"00") | ((xtvec.base + trapCause) @@ U"00"))
+            }
           }
         } else {
           // Original vectoring without CLIC
@@ -1529,8 +1609,8 @@ class CsrPlugin(val config: CsrPluginConfig) extends Plugin[VexRiscv] with Excep
               if(exceptionPortCtrl != null) when(hadException){
                 mtval := exceptionPortCtrl.exceptionContext.badAddr
               }
-              // Update CLIC mintstatus for interrupt nesting
-              if(clicSupport) {
+              // Update CLIC mintstatus for interrupt nesting (standard CLIC only)
+              if(clicSupport && !clicMinimal) {
                 when(interruptJump && clicInterrupt) {
                   machineCsr.clic.mintstatus := clicInterruptPriority
                 }
