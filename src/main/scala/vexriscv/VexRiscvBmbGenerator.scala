@@ -35,6 +35,13 @@ case class VexRiscvBmbGenerator()(implicit interconnectSmp: BmbInterconnectGener
   val externalSupervisorInterrupt = Handle[Bool]
   val timerInterrupt = Handle[Bool]
   val softwareInterrupt = Handle[Bool]
+  
+  // CLIC signals (only created when CLIC is enabled)
+  val clicInterrupt = Handle[Bool]
+  val clicInterruptId = Handle[UInt]
+  val clicInterruptPriority = Handle[UInt]
+  val clicClaim = Handle[Bool]
+  val clicThreshold = Handle[UInt]
 
   def setTimerInterrupt(that: Handle[Bool]) =    Dependable(that, timerInterrupt){timerInterrupt := that}
   def setSoftwareInterrupt(that: Handle[Bool]) = Dependable(that, softwareInterrupt){softwareInterrupt := that}
@@ -158,6 +165,16 @@ case class VexRiscvBmbGenerator()(implicit interconnectSmp: BmbInterconnectGener
         timerInterrupt load plugin.timerInterrupt
         softwareInterrupt load plugin.softwareInterrupt
         if (plugin.config.supervisorGen) externalSupervisorInterrupt load plugin.externalInterruptS
+        
+        // Connect CLIC signals if CLIC is enabled
+        if(plugin.config.clicSupport) {
+          clicInterrupt load plugin.clicInterrupt
+          clicInterruptId load plugin.clicInterruptId
+          clicInterruptPriority load plugin.clicInterruptPriority
+          clicClaim load plugin.clicClaim
+          clicThreshold load plugin.clicThreshold
+        }
+        
         if(withRiscvDebug.get) {
           assert(plugin.debugBus != null, "You need to enable CsrPluginConfig.withPrivilegedDebug")
           debugRiscv <> plugin.debugBus
