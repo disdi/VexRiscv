@@ -131,6 +131,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
   var dTlbSize = 4
   var wishboneForce32b = false
   var exposeTime = false
+  var withClic = false
   assert(new scopt.OptionParser[Unit]("VexRiscvLitexSmpClusterCmdGen") {
     help("help").text("prints this usage text")
     opt[Unit]  ("coherent-dma") action { (v, c) => coherentDma = true }
@@ -158,6 +159,7 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
     opt[String]("itlb-size") action { (v, c) => iTlbSize = v.toInt }
     opt[String]("dtlb-size") action { (v, c) => dTlbSize = v.toInt }
     opt[String]("expose-time") action { (v, c) => exposeTime = v.toBoolean }
+    opt[String]("with-clic") action { (v, c) => withClic = v.toBoolean }
   }.parse(args, Unit).nonEmpty)
 
   val coherency = coherentDma || cpuCount > 1
@@ -185,7 +187,8 @@ object VexRiscvLitexSmpClusterCmdGen extends App {
           rvc = rvc,
           injectorStage = rvc,
           iTlbSize = iTlbSize,
-          dTlbSize = dTlbSize
+          dTlbSize = dTlbSize,
+          withClic = withClic
         )
         if(aesInstruction) c.add(new AesPlugin)
         c

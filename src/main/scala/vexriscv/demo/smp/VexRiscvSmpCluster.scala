@@ -211,6 +211,22 @@ class VexRiscvSmpClusterWithPeripherals(p : VexRiscvSmpClusterParameter) extends
 
   val interrupts = in Bits(32 bits)
   for(i <- 1 to 31) yield plic.addInterrupt(interrupts(i), i)
+  
+  // CLIC signals - expose for each core when CLIC is enabled
+  // Check if any CPU has CLIC support by checking for CsrPlugin with clicSupport
+  val withClic = p.cpuConfigs.exists(config => 
+    config.plugins.exists {
+      case plugin: vexriscv.plugin.CsrPlugin => plugin.config.clicSupport
+      case _ => false
+    }
+  )
+  
+  // CLIC signals - generate for each CPU
+  val clicInterrupt = withClic generate (in Bits(cpuCount bits))
+  val clicInterruptId = withClic generate (in Vec(UInt(12 bits), cpuCount))
+  val clicInterruptPriority = withClic generate (in Vec(UInt(8 bits), cpuCount))
+  val clicClaim = withClic generate (out Bits(cpuCount bits))
+  val clicThreshold = withClic generate (out Vec(UInt(8 bits), cpuCount))
 
   for ((core, cpuId) <- cores.zipWithIndex) {
     core.cpu.setTimerInterrupt(clint.timerInterrupt(cpuId))
@@ -219,6 +235,18 @@ class VexRiscvSmpClusterWithPeripherals(p : VexRiscvSmpClusterParameter) extends
     plic.mapping.load(PlicMapping.sifive)
     plic.addTarget(core.cpu.externalInterrupt)
     plic.addTarget(core.cpu.externalSupervisorInterrupt)
+    
+    // Connect CLIC signals if enabled
+    if(withClic) {
+      core.cpu.logic.produce {
+        core.cpu.clicInterrupt.get := clicInterrupt(cpuId)
+        core.cpu.clicInterruptId.get := clicInterruptId(cpuId)
+        core.cpu.clicInterruptPriority.get := clicInterruptPriority(cpuId)
+        clicClaim(cpuId) := core.cpu.clicClaim.get
+        clicThreshold(cpuId) := core.cpu.clicThreshold.get
+      }
+    }
+    
     List(clint.logic, core.cpu.logic).produce {
       for (plugin <- core.cpu.config.plugins) plugin match {
         case plugin: CounterPlugin if plugin.time != null => plugin.time := clint.logic.io.time
@@ -270,14 +298,70 @@ object VexRiscvSmpClusterGen {
                      privilegedDebug: Boolean = false,
                      privilegedDebugTriggers: Int = 2,
                      privilegedDebugTriggersLsu: Boolean = false,
-                     csrFull : Boolean = false
+                     csrFull : Boolean = false,
+                     withClic : Boolean = false
                     ) = {
     assert(iCacheSize/iCacheWays <= 4096, "Instruction cache ways can't be bigger than 4096 bytes")
     assert(dCacheSize/dCacheWays <= 4096, "Data cache ways can't be bigger than 4096 bytes")
     assert(!(withDouble && !withFloat))
 
     val misa = Riscv.misaToInt(s"ima${if(withFloat) "f" else ""}${if(withDouble) "d" else ""}${if(rvc) "c" else ""}${if(withSupervisor) "su" else ""}")
-    val csrConfig = if(withSupervisor){
+    val csrConfig = if(withClic) {
+      // CLIC configuration
+      if(withSupervisor){
+        var c = CsrPluginConfig.withClic(
+          CsrPluginConfig.openSbi(mhartid = hartId, misa = misa).copy(
+            utimeAccess = CsrAccess.READ_ONLY,
+            withPrivilegedDebug = privilegedDebug,
+            debugTriggers = privilegedDebugTriggers,
+            debugTriggersLsu = privilegedDebugTriggersLsu,
+            mtvecAccess = CsrAccess.WRITE_ONLY,  // CLIC requires write-only mtvec
+            wfiGenAsWait = false,  // Disable wfiGenAsWait to allow wfiGenAsNop
+            wfiGenAsNop = true,
+            xtvecModeGen = true  // Enable vectored mode for CLIC
+          )
+        )
+      if(csrFull){
+       c = c.copy(
+         mcauseAccess   = CsrAccess.READ_WRITE,
+         mbadaddrAccess = CsrAccess.READ_WRITE,
+         ucycleAccess   = CsrAccess.READ_ONLY,
+         uinstretAccess = CsrAccess.READ_ONLY,
+         mcycleAccess   = CsrAccess.READ_WRITE,
+         minstretAccess = CsrAccess.READ_WRITE
+       )
+      }
+      c
+      } else {
+        assert(!csrFull)
+        CsrPluginConfig.withClic(
+          CsrPluginConfig(
+            catchIllegalAccess = true,
+            mvendorid      = 0,
+            marchid        = 0,
+            mimpid         = 0,
+            mhartid        = hartId,
+            misaExtensionsInit = misa,
+            misaAccess     = if(forceMisa) CsrAccess.READ_ONLY else CsrAccess.NONE,
+            mtvecAccess    = CsrAccess.WRITE_ONLY,  // CLIC requires write-only mtvec
+            mtvecInit      = null,
+            mepcAccess     = CsrAccess.READ_WRITE,
+            mscratchGen    = forceMscratch,
+            mcauseAccess   = CsrAccess.READ_ONLY,
+            mbadaddrAccess = CsrAccess.READ_ONLY,
+            mcycleAccess   = CsrAccess.NONE,
+            minstretAccess = CsrAccess.NONE,
+            ecallGen       = true,
+            ebreakGen      = true,
+            wfiGenAsWait   = false,
+            wfiGenAsNop    = true,
+            ucycleAccess   = CsrAccess.NONE,
+            withPrivilegedDebug = privilegedDebug,
+            xtvecModeGen   = true  // Enable vectored mode for CLIC
+          )
+        )
+      }
+    } else if(withSupervisor){
       var c = CsrPluginConfig.openSbi(mhartid = hartId, misa = misa).copy(
         utimeAccess = CsrAccess.READ_ONLY,
         withPrivilegedDebug = privilegedDebug,

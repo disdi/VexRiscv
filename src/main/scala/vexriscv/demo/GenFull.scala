@@ -74,7 +74,18 @@ object GenFull extends App{
       ),
       new MulPlugin,
       new DivPlugin,
-      new CsrPlugin(CsrPluginConfig.small(0x80000020l)),
+      new CsrPlugin(
+        CsrPluginConfig.withClic(
+          CsrPluginConfig.all(0x80000020l)
+        .copy(
+          mtvecAccess = CsrAccess.WRITE_ONLY,
+          ecallGen = true,
+          wfiGenAsWait = false,  // Disable wfiGenAsWait to allow wfiGenAsNop
+          wfiGenAsNop = true,
+          xtvecModeGen = true  // Enable vectored mode for CLIC
+        )
+        )
+      ),
       new DebugPlugin(ClockDomain.current.clone(reset = Bool().setName("debugReset"))),
       new BranchPlugin(
         earlyBranch = false,
